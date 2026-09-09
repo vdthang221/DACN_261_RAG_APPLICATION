@@ -19,11 +19,16 @@ Bảng cha chưa nhất thiết có bản ghi con ngay khi được tạo. Ví d
 
 | Trang | Nội dung | Số bảng |
 |---|---|---|
+| 00 | Tổng quan đầy đủ, chỉ hiện PK/FK và 50 quan hệ khóa ngoại | 34 |
 | 01 | Ngu lieu | 6 |
 | 02 | Ma tran va cau hinh | 8 |
 | 03 | Generate Verify Regenerate | 8 |
 | 04 | Kho MCQ va danh gia | 7 |
 | 05 | Dataset va nhan Bloom | 5 |
+
+Trang 00 gom cùng 34 bảng của các trang 01–05 vào 5 khung scope: 01 có 6 bảng, 02 có 8 bảng, 03 có 8 bảng, 04 có 7 bảng và 05 có 5 bảng. Không cộng 34 bảng tổng quan với số bảng chi tiết. Tổng quan thể hiện đủ 50 quan hệ FK, kể cả quan hệ giữa các scope và previous_version tự tham chiếu; các trang chi tiết dùng ký hiệu ↗ cho FK sang trang khác.
+
+Bản draw.io: [erd_doan.drawio](https://app.diagrams.net/#G1jAvpQl3JkBSmoDWSIoco98nDabcfqOR8). Hướng dẫn luồng và lý do thiết kế: [ERD_FLOW_GUIDE.md](ERD_FLOW_GUIDE.md).
 
 ## 01 - Ngu lieu
 

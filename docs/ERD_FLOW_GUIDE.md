@@ -23,7 +23,7 @@ Ví dụ xuyên suốt: từ một bài code C++ tính tổng đã chạy đúng
 
 Hệ thống cần trả lời được: **Câu này sinh từ đâu, bằng cấu hình nào, đã thử bao nhiêu lần và dựa vào đâu để chấp nhận?** Phần lớn thiết kế bảng phục vụ truy vết và tái lập thực nghiệm.
 
-> Đường nối trên ERD biểu diễn quan hệ dữ liệu, không biểu diễn thứ tự thực thi. Trang tổng quan chỉ hiện 18 bảng trung tâm; năm trang chi tiết có đủ 34 bảng.
+> Đường nối trên ERD biểu diễn quan hệ dữ liệu, không biểu diễn thứ tự thực thi. Trang 00 – Tổng quan hiện đủ 34 bảng và 50 quan hệ khóa ngoại, chia thành 5 scope 01–05. Tổng quan chỉ hiện các cột PK/FK (giữ ký hiệu UK và NULL nếu có); năm trang chi tiết trình bày đầy đủ thuộc tính và ràng buộc của cùng 34 bảng, không phải các bảng bổ sung.
 
 ## 2. Scope 01 — Ngữ liệu
 
