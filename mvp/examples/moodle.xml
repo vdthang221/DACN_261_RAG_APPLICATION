@@ -1,0 +1,38 @@
+<?xml version='1.0' encoding='utf-8'?>
+<quiz>
+  <question type="multichoice">
+    <name>
+      <text>sum-array / 1</text>
+    </name>
+    <questiontext format="plain_text">
+      <text>Với input 3 và dãy 1 2 3, biến tổng sau khi cộng phần tử thứ hai có giá trị bao nhiêu?</text>
+    </questiontext>
+    <generalfeedback format="plain_text">
+      <text>Sau hai phần tử đầu, tổng bằng 1 + 2 = 3; phần tử thứ ba chưa được cộng.</text>
+    </generalfeedback>
+    <single>true</single>
+    <answer fraction="0" format="plain_text">
+      <text>1</text>
+    </answer>
+    <answer fraction="100" format="plain_text">
+      <text>3</text>
+    </answer>
+    <answer fraction="0" format="plain_text">
+      <text>6</text>
+    </answer>
+    <answer fraction="0" format="plain_text">
+      <text>0</text>
+    </answer>
+    <tags>
+      <tag>
+        <text>problem:sum-array</text>
+      </tag>
+      <tag>
+        <text>skill:S3</text>
+      </tag>
+      <tag>
+        <text>bloom:APPLY</text>
+      </tag>
+    </tags>
+  </question>
+</quiz>

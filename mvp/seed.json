@@ -1,0 +1,30 @@
+[
+  {
+    "id": "sum-array", "title": "Tổng mảng số nguyên", "topic": "Mảng", "difficulty": "Dễ", "skills": ["S2", "S3", "S6"], "bloom": "APPLY",
+    "description": "Cho một dãy n số nguyên, hãy tính tổng các phần tử.\n\nInput: dòng đầu chứa n (0 ≤ n ≤ 100000). Dòng tiếp theo chứa n số nguyên aᵢ (−10⁹ ≤ aᵢ ≤ 10⁹).\nOutput: một số nguyên là tổng của dãy. Với n = 0, in 0.\n\nLưu ý: tổng có thể vượt phạm vi int 32-bit.",
+    "starter": "#include <iostream>\nusing namespace std;\n\nint main() {\n    int n;\n    cin >> n;\n    // TODO: đọc n số nguyên và in tổng\n\n    return 0;\n}\n",
+    "solution": "#include <iostream>\nusing namespace std;\nint main() {\n    int n; cin >> n;\n    long long sum = 0, x;\n    for (int i = 0; i < n; ++i) { cin >> x; sum += x; }\n    cout << sum << '\\n';\n}\n",
+    "tests": [{"input":"3\n1 2 3\n","expected":"6\n"},{"input":"5\n-1 0 1 -1 0\n","expected":"-1\n"},{"input":"0\n","expected":"0\n"},{"input":"4\n1000000000 1000000000 1000000000 1000000000\n","expected":"4000000000\n"}]
+  },
+  {
+    "id":"palindrome-string", "title":"Chuỗi đối xứng", "topic":"Chuỗi & hai con trỏ", "difficulty":"Dễ", "skills":["S2","S3","S6"], "bloom":"ANALYZE",
+    "description":"Một chuỗi đối xứng đọc từ trái sang phải giống từ phải sang trái. Kiểm tra chuỗi s có đối xứng hay không.\n\nInput: một chuỗi chỉ gồm chữ cái tiếng Anh viết thường, 1 ≤ |s| ≤ 100000, không có khoảng trắng.\nOutput: YES nếu đối xứng, ngược lại NO.",
+    "starter":"#include <iostream>\n#include <string>\nusing namespace std;\n\nint main() {\n    string s;\n    cin >> s;\n    // TODO: kiểm tra hai đầu chuỗi\n\n    return 0;\n}\n",
+    "solution":"#include <iostream>\n#include <string>\nusing namespace std;\nint main() {\n    string s; cin >> s;\n    int l = 0, r = (int)s.size() - 1;\n    while (l < r) {\n        if (s[l] != s[r]) { cout << \"NO\\n\"; return 0; }\n        ++l; --r;\n    }\n    cout << \"YES\\n\";\n}\n",
+    "tests":[{"input":"aba\n","expected":"YES\n"},{"input":"abba\n","expected":"YES\n"},{"input":"abc\n","expected":"NO\n"},{"input":"a\n","expected":"YES\n"}]
+  },
+  {
+    "id":"binary-search-first-index", "title":"Vị trí xuất hiện đầu tiên", "topic":"Tìm kiếm nhị phân", "difficulty":"Trung bình", "skills":["S3","S5","S6"], "bloom":"ANALYZE",
+    "description":"Cho mảng đã sắp xếp không giảm và giá trị x. Tìm chỉ số đầu tiên có giá trị bằng x; nếu không có, in −1.\n\nInput: dòng đầu chứa n và x (0 ≤ n ≤ 100000, |x| ≤ 10⁹). Dòng thứ hai chứa n số nguyên đã sắp xếp, |aᵢ| ≤ 10⁹.\nOutput: chỉ số đầu tiên, đánh số từ 0, hoặc −1.\n\nMục tiêu học tập: tìm kiếm nhị phân O(log n) sau khi đọc mảng. Testcase mẫu chỉ chấm output, không chứng minh độ phức tạp.",
+    "starter":"#include <iostream>\n#include <vector>\nusing namespace std;\n\nint main() {\n    int n, x;\n    cin >> n >> x;\n    vector<int> a(n);\n    for (int &v : a) cin >> v;\n    // TODO: tìm chỉ số đầu tiên của x\n\n    return 0;\n}\n",
+    "solution":"#include <iostream>\n#include <vector>\nusing namespace std;\nint main() {\n    int n, x; cin >> n >> x;\n    vector<int> a(n); for (int &v : a) cin >> v;\n    int l = 0, r = n - 1, ans = -1;\n    while (l <= r) {\n        int mid = l + (r - l) / 2;\n        if (a[mid] >= x) {\n            if (a[mid] == x) ans = mid;\n            r = mid - 1;\n        } else l = mid + 1;\n    }\n    cout << ans << '\\n';\n}\n",
+    "tests":[{"input":"5 3\n1 2 3 4 5\n","expected":"2\n"},{"input":"7 2\n1 2 2 2 3 4 5\n","expected":"1\n"},{"input":"4 5\n1 2 3 4\n","expected":"-1\n"},{"input":"0 10\n","expected":"-1\n"},{"input":"6 10\n10 10 10 10 10 10\n","expected":"0\n"}]
+  },
+  {
+    "id":"balanced-parentheses", "title":"Dãy ngoặc hợp lệ", "topic":"Ngăn xếp", "difficulty":"Trung bình", "skills":["S3","S5","S6"], "bloom":"ANALYZE",
+    "description":"Cho chuỗi chỉ gồm '(' và ')'. Dãy ngoặc hợp lệ khi mỗi ngoặc mở được đóng đúng thứ tự và không còn ngoặc thừa.\n\nInput: một chuỗi s, 1 ≤ |s| ≤ 100000.\nOutput: YES nếu hợp lệ, ngược lại NO.\n\nVí dụ: (()) hợp lệ, )( không hợp lệ dù số lượng hai loại ngoặc bằng nhau.",
+    "starter":"#include <iostream>\n#include <string>\n#include <stack>\nusing namespace std;\n\nint main() {\n    string s;\n    cin >> s;\n    // TODO: kiểm tra thứ tự đóng/mở ngoặc\n\n    return 0;\n}\n",
+    "solution":"#include <iostream>\n#include <string>\n#include <stack>\nusing namespace std;\nint main() {\n    string s; cin >> s;\n    stack<char> st;\n    for (char c : s) {\n        if (c == '(') st.push(c);\n        else {\n            if (st.empty()) { cout << \"NO\\n\"; return 0; }\n            st.pop();\n        }\n    }\n    cout << (st.empty() ? \"YES\\n\" : \"NO\\n\");\n}\n",
+    "tests":[{"input":"()\n","expected":"YES\n"},{"input":"(())\n","expected":"YES\n"},{"input":"()()\n","expected":"YES\n"},{"input":"(()\n","expected":"NO\n"},{"input":")(\n","expected":"NO\n"}]
+  }
+]

@@ -1,0 +1,298 @@
+<?xml version='1.0' encoding='utf-8'?>
+<problem-bank version="1">
+  <problem id="sum-array">
+    <title>Tổng mảng số nguyên</title>
+    <topic>Mảng</topic>
+    <difficulty>Dễ</difficulty>
+    <description>Cho một dãy n số nguyên, hãy tính tổng các phần tử.
+
+Input: dòng đầu chứa n (0 ≤ n ≤ 100000). Dòng tiếp theo chứa n số nguyên aᵢ (−10⁹ ≤ aᵢ ≤ 10⁹).
+Output: một số nguyên là tổng của dãy. Với n = 0, in 0.
+
+Lưu ý: tổng có thể vượt phạm vi int 32-bit.</description>
+    <starter>#include &lt;iostream&gt;
+using namespace std;
+
+int main() {
+    int n;
+    cin &gt;&gt; n;
+    // TODO: đọc n số nguyên và in tổng
+
+    return 0;
+}
+</starter>
+    <solution>#include &lt;iostream&gt;
+using namespace std;
+int main() {
+    int n; cin &gt;&gt; n;
+    long long sum = 0, x;
+    for (int i = 0; i &lt; n; ++i) { cin &gt;&gt; x; sum += x; }
+    cout &lt;&lt; sum &lt;&lt; '\n';
+}
+</solution>
+    <bloom>APPLY</bloom>
+    <skills>
+      <skill>S2</skill>
+      <skill>S3</skill>
+      <skill>S6</skill>
+    </skills>
+    <tests>
+      <test>
+        <input>3
+1 2 3
+</input>
+        <expected>6
+</expected>
+      </test>
+      <test>
+        <input>5
+-1 0 1 -1 0
+</input>
+        <expected>-1
+</expected>
+      </test>
+      <test>
+        <input>0
+</input>
+        <expected>0
+</expected>
+      </test>
+      <test>
+        <input>4
+1000000000 1000000000 1000000000 1000000000
+</input>
+        <expected>4000000000
+</expected>
+      </test>
+    </tests>
+  </problem>
+  <problem id="palindrome-string">
+    <title>Chuỗi đối xứng</title>
+    <topic>Chuỗi &amp; hai con trỏ</topic>
+    <difficulty>Dễ</difficulty>
+    <description>Một chuỗi đối xứng đọc từ trái sang phải giống từ phải sang trái. Kiểm tra chuỗi s có đối xứng hay không.
+
+Input: một chuỗi chỉ gồm chữ cái tiếng Anh viết thường, 1 ≤ |s| ≤ 100000, không có khoảng trắng.
+Output: YES nếu đối xứng, ngược lại NO.</description>
+    <starter>#include &lt;iostream&gt;
+#include &lt;string&gt;
+using namespace std;
+
+int main() {
+    string s;
+    cin &gt;&gt; s;
+    // TODO: kiểm tra hai đầu chuỗi
+
+    return 0;
+}
+</starter>
+    <solution>#include &lt;iostream&gt;
+#include &lt;string&gt;
+using namespace std;
+int main() {
+    string s; cin &gt;&gt; s;
+    int l = 0, r = (int)s.size() - 1;
+    while (l &lt; r) {
+        if (s[l] != s[r]) { cout &lt;&lt; "NO\n"; return 0; }
+        ++l; --r;
+    }
+    cout &lt;&lt; "YES\n";
+}
+</solution>
+    <bloom>ANALYZE</bloom>
+    <skills>
+      <skill>S2</skill>
+      <skill>S3</skill>
+      <skill>S6</skill>
+    </skills>
+    <tests>
+      <test>
+        <input>aba
+</input>
+        <expected>YES
+</expected>
+      </test>
+      <test>
+        <input>abba
+</input>
+        <expected>YES
+</expected>
+      </test>
+      <test>
+        <input>abc
+</input>
+        <expected>NO
+</expected>
+      </test>
+      <test>
+        <input>a
+</input>
+        <expected>YES
+</expected>
+      </test>
+    </tests>
+  </problem>
+  <problem id="binary-search-first-index">
+    <title>Vị trí xuất hiện đầu tiên</title>
+    <topic>Tìm kiếm nhị phân</topic>
+    <difficulty>Trung bình</difficulty>
+    <description>Cho mảng đã sắp xếp không giảm và giá trị x. Tìm chỉ số đầu tiên có giá trị bằng x; nếu không có, in −1.
+
+Input: dòng đầu chứa n và x (0 ≤ n ≤ 100000, |x| ≤ 10⁹). Dòng thứ hai chứa n số nguyên đã sắp xếp, |aᵢ| ≤ 10⁹.
+Output: chỉ số đầu tiên, đánh số từ 0, hoặc −1.
+
+Mục tiêu học tập: tìm kiếm nhị phân O(log n) sau khi đọc mảng. Testcase mẫu chỉ chấm output, không chứng minh độ phức tạp.</description>
+    <starter>#include &lt;iostream&gt;
+#include &lt;vector&gt;
+using namespace std;
+
+int main() {
+    int n, x;
+    cin &gt;&gt; n &gt;&gt; x;
+    vector&lt;int&gt; a(n);
+    for (int &amp;v : a) cin &gt;&gt; v;
+    // TODO: tìm chỉ số đầu tiên của x
+
+    return 0;
+}
+</starter>
+    <solution>#include &lt;iostream&gt;
+#include &lt;vector&gt;
+using namespace std;
+int main() {
+    int n, x; cin &gt;&gt; n &gt;&gt; x;
+    vector&lt;int&gt; a(n); for (int &amp;v : a) cin &gt;&gt; v;
+    int l = 0, r = n - 1, ans = -1;
+    while (l &lt;= r) {
+        int mid = l + (r - l) / 2;
+        if (a[mid] &gt;= x) {
+            if (a[mid] == x) ans = mid;
+            r = mid - 1;
+        } else l = mid + 1;
+    }
+    cout &lt;&lt; ans &lt;&lt; '\n';
+}
+</solution>
+    <bloom>ANALYZE</bloom>
+    <skills>
+      <skill>S3</skill>
+      <skill>S5</skill>
+      <skill>S6</skill>
+    </skills>
+    <tests>
+      <test>
+        <input>5 3
+1 2 3 4 5
+</input>
+        <expected>2
+</expected>
+      </test>
+      <test>
+        <input>7 2
+1 2 2 2 3 4 5
+</input>
+        <expected>1
+</expected>
+      </test>
+      <test>
+        <input>4 5
+1 2 3 4
+</input>
+        <expected>-1
+</expected>
+      </test>
+      <test>
+        <input>0 10
+</input>
+        <expected>-1
+</expected>
+      </test>
+      <test>
+        <input>6 10
+10 10 10 10 10 10
+</input>
+        <expected>0
+</expected>
+      </test>
+    </tests>
+  </problem>
+  <problem id="balanced-parentheses">
+    <title>Dãy ngoặc hợp lệ</title>
+    <topic>Ngăn xếp</topic>
+    <difficulty>Trung bình</difficulty>
+    <description>Cho chuỗi chỉ gồm '(' và ')'. Dãy ngoặc hợp lệ khi mỗi ngoặc mở được đóng đúng thứ tự và không còn ngoặc thừa.
+
+Input: một chuỗi s, 1 ≤ |s| ≤ 100000.
+Output: YES nếu hợp lệ, ngược lại NO.
+
+Ví dụ: (()) hợp lệ, )( không hợp lệ dù số lượng hai loại ngoặc bằng nhau.</description>
+    <starter>#include &lt;iostream&gt;
+#include &lt;string&gt;
+#include &lt;stack&gt;
+using namespace std;
+
+int main() {
+    string s;
+    cin &gt;&gt; s;
+    // TODO: kiểm tra thứ tự đóng/mở ngoặc
+
+    return 0;
+}
+</starter>
+    <solution>#include &lt;iostream&gt;
+#include &lt;string&gt;
+#include &lt;stack&gt;
+using namespace std;
+int main() {
+    string s; cin &gt;&gt; s;
+    stack&lt;char&gt; st;
+    for (char c : s) {
+        if (c == '(') st.push(c);
+        else {
+            if (st.empty()) { cout &lt;&lt; "NO\n"; return 0; }
+            st.pop();
+        }
+    }
+    cout &lt;&lt; (st.empty() ? "YES\n" : "NO\n");
+}
+</solution>
+    <bloom>ANALYZE</bloom>
+    <skills>
+      <skill>S3</skill>
+      <skill>S5</skill>
+      <skill>S6</skill>
+    </skills>
+    <tests>
+      <test>
+        <input>()
+</input>
+        <expected>YES
+</expected>
+      </test>
+      <test>
+        <input>(())
+</input>
+        <expected>YES
+</expected>
+      </test>
+      <test>
+        <input>()()
+</input>
+        <expected>YES
+</expected>
+      </test>
+      <test>
+        <input>(()
+</input>
+        <expected>NO
+</expected>
+      </test>
+      <test>
+        <input>)(
+</input>
+        <expected>NO
+</expected>
+      </test>
+    </tests>
+  </problem>
+</problem-bank>
