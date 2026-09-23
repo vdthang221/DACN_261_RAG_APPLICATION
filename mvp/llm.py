@@ -1,6 +1,15 @@
-"""Gemini JSON contracts. Scheduling and quota accounting live in server.py."""
+"""Gemini JSON contracts and the raw provider transport.
+
+Every production call is scheduled by ``server.py`` before this transport is
+invoked.  Keeping the HTTP client retry-free is intentional: a retry must
+reserve quota through the shared SQLite limiter first.
+"""
+from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 import json
 import os
+import socket
+import time
 import urllib.error
 import urllib.request
 
@@ -8,9 +17,22 @@ from bank import required_text, validate_mcqs
 
 
 class ProviderError(Exception):
-    def __init__(self, message, retryable=False, retry_after=0):
+    def __init__(self, message, retryable=False, retry_after=0, code="provider_error",
+                 retry_at=0, request_sent=False):
         super().__init__(message)
-        self.retryable, self.retry_after = retryable, retry_after
+        self.retryable = retryable
+        self.retry_after = max(0, float(retry_after or 0))
+        self.code = code
+        self.retry_at = max(0, float(retry_at or 0))
+        self.request_sent = bool(request_sent)
+
+
+@dataclass(frozen=True)
+class ProviderResponse:
+    result: dict
+    prompt_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
 
 
 MCQ_SCHEMA = {"type": "OBJECT", "properties": {"questions": {"type": "ARRAY", "minItems": 3, "maxItems": 3,
@@ -52,40 +74,93 @@ def build_request(attempt):
                                  "responseMimeType": "application/json", "responseSchema": schema}}
 
 
+def encode_payload(payload):
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+
+
+def _retry_after(headers, now=None):
+    value = headers.get("Retry-After", "") if headers else ""
+    if not value:
+        return 0
+    try:
+        return min(3600, max(0, int(value)))
+    except (TypeError, ValueError):
+        try:
+            target = parsedate_to_datetime(value).timestamp()
+            return min(3600, max(0, target - (time.time() if now is None else now)))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+
+def _http_error(exc):
+    retry_after = _retry_after(exc.headers)
+    try:
+        raw = exc.read(65537)
+        details = json.loads(raw[:65536]) if raw else {}
+    except (OSError, ValueError, TypeError):
+        details = {}
+    description = json.dumps(details, ensure_ascii=False).lower()
+    if exc.code == 429:
+        daily = any(marker in description for marker in
+                    ("perday", "per_day", "requestsperday", "daily", "per day"))
+        minute = any(marker in description for marker in
+                     ("perminute", "per_minute", "requestsperminute", "rpm", "per minute"))
+        if daily:
+            return ProviderError("Google báo đã hết quota ngày.", code="provider_daily_quota",
+                                 request_sent=True)
+        if minute or retry_after:
+            return ProviderError("Google đang giới hạn quota phút (HTTP 429).", True, retry_after,
+                                 code="provider_minute_quota", request_sent=True)
+        return ProviderError("Google trả HTTP 429 nhưng không cho biết cửa sổ quota; không tự retry mù.",
+                             code="provider_rate_limit_unknown", request_sent=True)
+    if exc.code in {500, 502, 503, 504}:
+        return ProviderError(f"Google tạm bận (HTTP {exc.code}).", True, retry_after,
+                             code="provider_unavailable", request_sent=True)
+    if exc.code in {401, 403}:
+        return ProviderError(f"Google từ chối xác thực/quyền project (HTTP {exc.code}).",
+                             code="provider_auth", request_sent=True)
+    return ProviderError(f"Google từ chối yêu cầu (HTTP {exc.code}). Kiểm tra model và cấu hình project.",
+                         code="provider_rejected", request_sent=True)
+
+
 def call_gemini(payload):
     key = os.getenv("GEMINI_API_KEY", "")
     if not key:
-        raise ProviderError("Chưa cấu hình GEMINI_API_KEY trên server. Nhờ giảng viên cấu hình rồi bấm Thử lại.")
-    model = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+        raise ProviderError("Chưa cấu hình GEMINI_API_KEY trên server. Nhờ giảng viên cấu hình rồi bấm Thử lại.",
+                            code="provider_not_configured")
+    model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
     if not __import__('re').fullmatch(r"[a-zA-Z0-9.-]+", model):
-        raise ProviderError("GEMINI_MODEL không hợp lệ.")
+        raise ProviderError("GEMINI_MODEL không hợp lệ.", code="provider_not_configured")
     request = urllib.request.Request(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-        data=json.dumps(payload).encode(), headers={"Content-Type": "application/json", "x-goog-api-key": key}, method="POST")
+        data=encode_payload(payload), headers={"Content-Type": "application/json", "x-goog-api-key": key}, method="POST")
     try:
-        with urllib.request.urlopen(request, timeout=int(os.getenv("LLM_TIMEOUT_SECONDS", "60"))) as response:
+        with urllib.request.urlopen(request, timeout=float(os.getenv("LLM_TIMEOUT_SECONDS", "60"))) as response:
             raw = response.read(200001)
             if len(raw) > 200000:
-                raise ProviderError("Phản hồi LLM quá lớn.")
+                raise ProviderError("Phản hồi LLM quá lớn.", code="provider_response_too_large",
+                                    request_sent=True)
             data = json.loads(raw)
     except urllib.error.HTTPError as exc:
-        retry_after = exc.headers.get("Retry-After", "0")
-        try:
-            retry_after = min(3600, max(0, int(retry_after)))
-        except ValueError:
-            retry_after = 0
-        if exc.code in {429, 500, 502, 503, 504}:
-            raise ProviderError(f"Google đang giới hạn hoặc tạm bận (HTTP {exc.code}).", True, retry_after) from None
-        raise ProviderError(f"Google từ chối yêu cầu (HTTP {exc.code}). Kiểm tra model, API key và quyền project.") from None
-    except (urllib.error.URLError, TimeoutError, OSError):
-        raise ProviderError("Không kết nối được Google AI trong thời gian cho phép.", True) from None
+        raise _http_error(exc) from None
+    except (urllib.error.URLError, TimeoutError, socket.timeout, OSError):
+        # urllib cannot prove whether the provider processed a timed-out request.
+        # Count the reservation and require an explicit user retry instead of an
+        # automatic duplicate generation.
+        raise ProviderError("Không xác định Google đã xử lý request hay chưa; không tự retry để tránh sinh trùng.",
+                            code="provider_outcome_unknown", request_sent=True) from None
     try:
         candidate = data["candidates"][0]
         if candidate.get("finishReason") != "STOP":
             raise ValueError("unfinished")
         text = "".join(part.get("text", "") for part in candidate["content"]["parts"] if not part.get("thought"))
-        return json.loads(text)
+        usage = data.get("usageMetadata") or {}
+        return ProviderResponse(json.loads(text),
+            max(0, int(usage.get("promptTokenCount") or 0)),
+            max(0, int(usage.get("candidatesTokenCount") or 0)),
+            max(0, int(usage.get("totalTokenCount") or 0)))
     except (KeyError, IndexError, TypeError, ValueError):
-        raise ProviderError("LLM trả dữ liệu chưa hoàn chỉnh/không đúng JSON. Có thể thử lại.") from None
+        raise ProviderError("LLM trả dữ liệu chưa hoàn chỉnh/không đúng JSON.",
+                            code="provider_invalid_response", request_sent=True) from None
 
 
 def validate_result(result, attempt):

@@ -25,7 +25,7 @@ Trong `.env`:
 
 ```dotenv
 GEMINI_API_KEY=điền_key_của_project_tại_đây
-GEMINI_MODEL=gemini-3.6-flash
+GEMINI_MODEL=gemini-3.8-flash
 LLM_MODE=gemini
 ADMIN_TOKEN=đặt_một_mã_quản_trị_dài_ngẫu_nhiên
 GOOGLE_CLIENT_ID=client_id_của_OAuth_web_app
@@ -71,28 +71,33 @@ Tham khảo: [Google OpenID Connect server flow](https://developers.google.com/i
 - Khôi phục job khi server restart; retry judge/LLM không làm mất đáp án.
 - XML bài lập trình và Moodle XML nhập/xuất qua màn hình **Ngân hàng XML**, có mã quản trị.
 
-## Gemini 3.6 Flash và 3 người đồng thời
+## Gemini 3.8 Flash và 3 người đồng thời
 
-Model ID đã đối chiếu: [`gemini-3.6-flash`](https://ai.google.dev/gemini-api/docs/models/gemini-3.6-flash). Dùng REST `generateContent`, JSON schema, temperature 0.2, tối đa 4096 output tokens/lần; không fine-tune model.
+Mặc định dùng `gemini-3.8-flash` qua REST `generateContent`, JSON schema, temperature 0.2, tối đa 4096 output tokens/lần; có thể override bằng `GEMINI_MODEL`, không tự đổi model/key/project để né quota.
 
 Google áp quota **theo project**, gồm RPM, input TPM, RPD; thêm key không tăng quota. Xem quota thực tế tại [Google AI Studio / tài liệu rate limits](https://ai.google.dev/gemini-api/docs/rate-limits). Không thể cam kết tuyệt đối không có 429 hoặc hết quota.
 
 | Cấu hình | Mặc định | Ý nghĩa |
 | --- | --- | --- |
-| `LLM_RPM` | 4 | Tối đa 4 request/phút, giãn ít nhất 15 giây |
-| `LLM_INPUT_TPM` | 20000 | Giới hạn input theo ước lượng bảo thủ bằng byte UTF-8 |
-| `LLM_RPD` | 100 | Giới hạn trên cửa sổ 24 giờ trượt, bảo thủ hơn lịch reset Google |
+| `LLM_QUOTA_BUCKET` | `codelit-google-project` | Tên bucket dùng chung cho project/model trong cùng DB |
+| `LLM_RPM` | 5 | Tối đa 5 request trong 60 giây, giãn ít nhất 12 giây |
+| `LLM_INPUT_TPM` | 250000 | Giới hạn input/phút theo ước lượng bảo thủ bằng byte UTF-8 |
+| `LLM_RPD` | 20 | Giới hạn theo ngày, reset 00:00 `America/Los_Angeles` có DST |
 | `LLM_MAX_OUTPUT_TOKENS` | 4096 | Giới hạn output |
 | `LLM_TIMEOUT_SECONDS` | 60 | Timeout một request |
+| `LLM_RETRY_LIMIT` | 3 | Tổng số lần gọi provider tối đa cho mỗi giai đoạn |
+| `LLM_QUEUE_MAX` | 20 | Số job đang xử lý tối đa |
+| `LLM_QUEUE_TIMEOUT_SECONDS` | 120 | Chờ quota tối đa trước khi trả trạng thái lỗi có `retry_at` |
 
-**Đây là ngân sách local khởi điểm, không phải quota được Google bảo đảm.** Đặt thấp hơn quota thật (gợi ý 70–80%) và trừ lưu lượng ứng dụng khác dùng cùng project. Nếu quota thấp hơn mặc định, phải giảm cấu hình. Một lượt hoàn thành cần 2 request: sinh MCQ + feedback. 3 người cần 6 request thành công; ở 4 RPM, thời điểm bắt đầu request thứ 6 cách request đầu ít nhất 75 giây, chưa tính thời gian làm MCQ, inference và retry. 100 RPD tương đương tối đa 50 lượt/ngày nếu không có retry/lỗi.
+**Bộ đếm SQLite chỉ phản ánh các lượt đi qua CODELIT, không phản ánh request từ ứng dụng khác dùng cùng Google project.** Vì vậy production nên dành headroom nếu project được dùng ở nơi khác. Bình thường một bài hoàn chỉnh cần 2 request: sinh MCQ và feedback. Với retry limit 3, trần là 6 request/provider cho một bài; không có pha verify/repair riêng. 20 RPD cho tối đa 10 bài/ngày khi không retry.
 
 - Railway dispatch tuần tự và gateway GCP mặc định chỉ chạy **1 judge container tại một thời điểm** trên `e2-medium`. **Một worker LLM** xử lý hàng đợi SQLite chung, không khóa HTTP/UI.
 - Mỗi sinh viên tối đa một job đang xử lý; tối đa 5 lần nộp mới/phút.
-- Quota reservation lưu bền, tính cả request lỗi; chờ quota thì job tự tiếp tục và UI hiện thời gian dự kiến.
-- HTTP 429/5xx/network lỗi: exponential backoff + jitter, tối đa 3 lần tự gọi mỗi giai đoạn; cooldown chung. Hết lượt tự retry thì hiển thị lỗi và nút thử lại; không quay API key, không tự nâng billing.
+- Quota reservation dùng transaction SQLite `BEGIN IMMEDIATE`, chia sẻ giữa thread/process trên cùng database, tính cả request lỗi/timeout và không hoàn quota khi kết quả provider chưa rõ.
+- Job được claim atomically. Restart chỉ tự chạy lại reservation chưa gửi; request đã đánh dấu gửi nhưng chưa có kết quả chuyển sang lỗi cần thao tác thủ công để tránh sinh trùng.
+- HTTP 429 phút có bounded exponential backoff + jitter và cooldown chung; quota ngày bị từ chối sớm đến mốc reset Pacific. 429 không rõ loại và timeout không tự retry mù.
 - Giới hạn code 12 KB, XML 500 KB, số testcase/MCQ và output. Schema lỗi thì dừng, không có semantic verification ngầm.
-- Chạy **một instance server trên một database**. Chưa hỗ trợ nhiều replica/worker process.
+- Railway hiện chạy **một replica, một process, một LLM worker thread** vì service gắn một volume SQLite. Nhiều worker process trên cùng file DB vẫn dùng chung limiter; nhiều replica có filesystem riêng không được hỗ trợ và không được phép tuyên bố chia sẻ quota.
 
 ## Ngân hàng XML
 

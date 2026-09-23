@@ -81,7 +81,8 @@ function attemptPage(a) {
   }
   if(active.includes(a.state)) container.insertAdjacentHTML('beforeend',`<div class="progress" role="status" aria-live="polite"><span class="spinner" aria-hidden="true"></span><div><strong>${esc(labels[a.state])}</strong><p>${esc(a.error||'Bạn có thể chuyển trang. Tiến trình được lưu và sẽ tự tiếp tục.')}${a.next_run>Date.now()/1000?` Lượt kế tiếp dự kiến: ${new Date(a.next_run*1000).toLocaleString('vi-VN')}.`:''}</p></div></div>`);
   if(['judge_error','llm_error'].includes(a.state)) {
-    container.insertAdjacentHTML('beforeend',`<div class="note error" role="alert">${esc(a.error||'Tác vụ bị gián đoạn khi server khởi động lại. Hãy thử lại.')}<div class="actions"><button id="retry">Thử lại</button><a href="#problem/${esc(a.problem.id)}"><button>Sửa code</button></a></div></div>`);
+    const retryTime=Math.max(a.retry_at||0,a.quota_reset_at||0);
+    container.insertAdjacentHTML('beforeend',`<div class="note error" role="alert">${esc(a.error||'Tác vụ bị gián đoạn khi server khởi động lại. Hãy thử lại.')}${retryTime>Date.now()/1000?` Có thể thử lại sau: ${new Date(retryTime*1000).toLocaleString('vi-VN')}.`:''}<div class="actions"><button id="retry">Thử lại</button><a href="#problem/${esc(a.problem.id)}"><button>Sửa code</button></a></div></div>`);
     $('#retry').onclick=async()=>{const b=$('#retry');b.disabled=true;try{await api(`/api/attempts/${a.id}/retry`,{});route();}catch(e){toast(e.message);b.disabled=false;}};
   }
 }

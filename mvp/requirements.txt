@@ -1,1 +1,2 @@
 google-auth[requests]==2.58.0
+tzdata==2025.2

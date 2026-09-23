@@ -1,8 +1,10 @@
 """Controller-owned acceptance tests. No real Gemini usage in this suite."""
 import concurrent.futures
 import copy
+from datetime import datetime
 import http.cookiejar
 import hashlib
+import io
 import secrets
 import json
 import os
@@ -38,7 +40,9 @@ class MVPTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.env = patch.dict(os.environ, {'DATABASE_PATH':str(Path(self.tmp.name)/'test.db'), 'LLM_MODE':'demo',
-            'ADMIN_TOKEN':'test-only-admin', 'LLM_RPM':'4', 'LLM_INPUT_TPM':'20000', 'LLM_RPD':'100'})
+            'ADMIN_TOKEN':'test-only-admin', 'LLM_QUOTA_BUCKET':'test-google-project', 'LLM_RPM':'5',
+            'LLM_INPUT_TPM':'250000', 'LLM_RPD':'20', 'LLM_RETRY_LIMIT':'3',
+            'LLM_QUEUE_MAX':'20', 'LLM_QUEUE_TIMEOUT_SECONDS':'120'})
         self.env.start()
         server.init_db()
         self.p = next(iter(server.all_problems().values()))
@@ -212,6 +216,16 @@ class MVPTests(unittest.TestCase):
         self.request(self.client,'/api/admin/import',{'xml':bank.problem_xml([p])},admin=True)
         self.assertEqual(server.get_attempt(a['id'])['problem']['title'],self.p['title'])
 
+    def test_bounded_queue_rejects_new_job_with_structured_error(self):
+        other=self.login(2)
+        with patch.dict(os.environ,{'LLM_QUEUE_MAX':'1'}),patch.object(server.POOL,'submit'):
+            self.submit(key='queue-first')
+            status,error=self.request(other,'/api/submissions',{
+                'problem_id':self.p['id'],'code':self.p['solution'],'request_id':'queue-second'})
+        self.assertEqual(status,429)
+        self.assertEqual(error['code'],'llm_queue_full')
+        self.assertGreater(error['retry_at'],time.time())
+
     def test_three_students_concurrent(self):
         clients=[self.client,self.login(2),self.login(3)]
         with patch.object(server,'run_judge',self.fake_judge),concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
@@ -225,22 +239,217 @@ class MVPTests(unittest.TestCase):
             server.process_llm(server.get_attempt(a['id']))
             self.assertEqual(server.get_attempt(a['id'])['state'],'completed')
 
+    def test_three_users_share_one_gemini_bucket(self):
+        clients=[self.client,self.login(2),self.login(3)]
+        with patch.object(server,'run_judge',self.fake_judge):
+            attempts=[self.wait_judge(self.submit(client,key=f'gemini-user-{index}'))
+                      for index,client in enumerate(clients)]
+        for attempt in attempts:
+            attempt['mode']='gemini';server.save_attempt(attempt)
+        response=llm.ProviderResponse(llm.demo_result(attempts[0]),100,50,150)
+        with patch.dict(os.environ,{'GEMINI_API_KEY':'test-not-real','LLM_QUOTA_BUCKET':'three-users'}), \
+             patch.object(server,'call_gemini',return_value=response) as provider, \
+             concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+            list(pool.map(lambda attempt:server.process_llm(attempt,250000),attempts))
+        states=[server.get_attempt(attempt['id'])['state'] for attempt in attempts]
+        self.assertEqual(states.count('mcq_ready'),1)
+        self.assertEqual(states.count('generate_pending'),2)
+        self.assertEqual(provider.call_count,1)
+
     def test_quota_spacing_tpm_and_daily_budget(self):
-        self.assertEqual(server.reserve_budget(1000,100000),0)
-        self.assertGreaterEqual(server.reserve_budget(1000,100001),100015)
-        with patch.dict(os.environ,{'LLM_INPUT_TPM':'1200'}):
-            self.assertGreaterEqual(server.reserve_budget(1000,100016),100061)
-            with self.assertRaises(llm.ProviderError):server.reserve_budget(1201,100016)
-        with patch.dict(os.environ,{'LLM_RPD':'1'}):
-            self.assertGreaterEqual(server.reserve_budget(100,100100),186401)
+        first=server.reserve_budget(1000,'job-1','generate',1,'call-1',100000)
+        self.assertTrue(first.granted)
+        delayed=server.reserve_budget(1000,'job-2','generate',1,'call-2',100001)
+        self.assertFalse(delayed.granted);self.assertGreaterEqual(delayed.wait_until,100012)
+        with patch.dict(os.environ,{'LLM_INPUT_TPM':'1200','LLM_QUOTA_BUCKET':'tpm-test'}):
+            self.assertTrue(server.reserve_budget(1000,'tpm-1','generate',1,'tpm-call-1',200000).granted)
+            limited=server.reserve_budget(1000,'tpm-2','generate',1,'tpm-call-2',200012)
+            self.assertFalse(limited.granted);self.assertIn('input_tpm',limited.reason)
+            with self.assertRaises(llm.ProviderError) as caught:
+                server.reserve_budget(1201,'large','generate',1,'large-call',200020)
+            self.assertEqual(caught.exception.code,'local_input_tpm')
+        with patch.dict(os.environ,{'LLM_RPD':'1','LLM_RPM':'1000','LLM_QUOTA_BUCKET':'daily-test'}):
+            self.assertTrue(server.reserve_budget(100,'daily-1','generate',1,'daily-call-1',300000).granted)
+            with self.assertRaises(llm.ProviderError) as caught:
+                server.reserve_budget(100,'daily-2','generate',1,'daily-call-2',300001)
+            self.assertEqual(caught.exception.code,'local_daily_quota')
+        with patch.dict(os.environ,{'LLM_RPD':'20','LLM_RPM':'1000','LLM_QUOTA_BUCKET':'daily-twenty'}):
+            for index in range(20):
+                self.assertTrue(server.reserve_budget(100,f'day20-{index}','generate',1,
+                    f'day20-call-{index}',310000+index*.1).granted)
+            with self.assertRaises(llm.ProviderError) as caught:
+                server.reserve_budget(100,'day20-21','generate',1,'day20-call-21',310003)
+            self.assertEqual(caught.exception.code,'local_daily_quota')
+
+    def test_quota_queue_timeout_is_total_not_per_wait(self):
+        with patch.object(server,'run_judge',self.fake_judge):
+            attempt=self.wait_judge(self.submit())
+        attempt['mode']='gemini';server.save_attempt(attempt)
+        def wait_decision(tokens,job_id,stage,attempt_no,call_id,now):
+            return server.QuotaDecision(False,call_id,wait_until=now+20,reason='rpm_spacing')
+        with patch.dict(os.environ,{'GEMINI_API_KEY':'test-not-real','LLM_QUEUE_TIMEOUT_SECONDS':'30'}), \
+             patch.object(server,'reserve_budget',side_effect=wait_decision):
+            server.process_llm(attempt,100000)
+            queued=server.get_attempt(attempt['id'])
+            self.assertEqual(queued['state'],'generate_pending')
+            server.process_llm(queued,100020)
+        stopped=server.get_attempt(attempt['id'])
+        self.assertEqual(stopped['state'],'llm_error')
+        self.assertEqual(stopped['error_code'],'quota_wait_too_long')
+
+    def test_three_workers_share_atomic_quota_and_sixth_request_waits(self):
+        barrier=threading.Barrier(3)
+        def reserve(index):
+            barrier.wait()
+            return server.reserve_budget(100,f'worker-{index}','generate',1,f'worker-call-{index}',500000)
+        with patch.dict(os.environ,{'LLM_QUOTA_BUCKET':'workers-test','LLM_RPM':'5'}), \
+             concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+            decisions=list(pool.map(reserve,range(3)))
+        self.assertEqual(sum(d.granted for d in decisions),1)
+        self.assertTrue(all(d.granted or d.wait_until>=500012 for d in decisions))
+        with server.connect() as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM llm_calls WHERE bucket='workers-test'").fetchone()[0],1)
+
+        with patch.dict(os.environ,{'LLM_QUOTA_BUCKET':'rpm-test','LLM_RPM':'5'}):
+            for index,offset in enumerate([0,12,24,36,48]):
+                decision=server.reserve_budget(100,f'rpm-{index}','generate',1,f'rpm-call-{index}',600000+offset)
+                self.assertTrue(decision.granted)
+            sixth=server.reserve_budget(100,'rpm-5','generate',1,'rpm-call-5',600059)
+            self.assertFalse(sixth.granted);self.assertGreaterEqual(sixth.wait_until,600060)
+
+    def test_pacific_daily_reset_handles_dst_and_restart(self):
+        start=datetime(2026,3,8,0,30,tzinfo=server.PACIFIC).timestamp()
+        day,reset=server.quota_day_window(start)
+        self.assertEqual(day,'2026-03-08')
+        reset_local=datetime.fromtimestamp(reset,server.PACIFIC)
+        self.assertEqual((reset_local.date().isoformat(),reset_local.hour,reset_local.minute),('2026-03-09',0,0))
+        with patch.dict(os.environ,{'LLM_QUOTA_BUCKET':'dst-test','LLM_RPD':'1','LLM_RPM':'1000'}):
+            self.assertTrue(server.reserve_budget(10,'dst-1','generate',1,'dst-call-1',start).granted)
+            server.init_db()
+            with self.assertRaises(llm.ProviderError) as caught:
+                server.reserve_budget(10,'dst-2','generate',1,'dst-call-2',reset-1)
+            self.assertEqual(caught.exception.code,'local_daily_quota')
+            self.assertTrue(server.reserve_budget(10,'dst-3','generate',1,'dst-call-3',reset+.1).granted)
+
+    def test_only_one_worker_claims_a_pending_job(self):
+        with patch.object(server,'run_judge',self.fake_judge):
+            pending=self.wait_judge(self.submit())
+        barrier=threading.Barrier(3)
+        def claim(_):
+            barrier.wait()
+            return server.claim_llm_job(700000)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+            claimed=list(pool.map(claim,range(3)))
+        winners=[a for a in claimed if a]
+        self.assertEqual(len(winners),1);self.assertEqual(winners[0]['id'],pending['id'])
+        self.assertEqual(server.get_attempt(pending['id'])['state'],'generating')
+
+    def test_daily_quota_midway_never_completes_partial_task(self):
+        with patch.object(server,'run_judge',self.fake_judge):
+            a=self.wait_judge(self.submit())
+        a['mode']='gemini';server.save_attempt(a)
+        generated=llm.demo_result(a)
+        with patch.dict(os.environ,{'GEMINI_API_KEY':'test-not-real','LLM_QUOTA_BUCKET':'midway-test',
+             'LLM_RPD':'1','LLM_RPM':'1000'}),patch.object(server,'call_gemini',return_value=llm.ProviderResponse(generated,100,50,150)) as provider:
+            server.process_llm(a,800000)
+            ready=server.get_attempt(a['id']);self.assertEqual(ready['state'],'mcq_ready')
+            answers=[q['answer'] for q in ready['questions']]
+            self.assertEqual(self.request(self.client,f"/api/attempts/{a['id']}/answers",{'answers':answers})[0],202)
+            server.process_llm(server.get_attempt(a['id']),800001)
+            stopped=server.get_attempt(a['id'])
+        self.assertEqual(provider.call_count,1)
+        self.assertEqual((stopped['state'],stopped['stage'],stopped['error_code']),('llm_error','feedback','local_daily_quota'))
+        self.assertIn('answers',stopped);self.assertNotIn('feedback',stopped)
+
+    def test_unknown_provider_outcome_is_counted_and_not_auto_retried(self):
+        with patch.object(server,'run_judge',self.fake_judge):
+            a=self.wait_judge(self.submit())
+        a['mode']='gemini';server.save_attempt(a)
+        unknown=llm.ProviderError('unknown outcome',code='provider_outcome_unknown',request_sent=True)
+        with patch.dict(os.environ,{'GEMINI_API_KEY':'test-not-real','LLM_QUOTA_BUCKET':'timeout-test',
+             'LLM_RPM':'1000'}),patch.object(server,'call_gemini',side_effect=unknown) as provider:
+            server.process_llm(a,900000)
+            failed=server.get_attempt(a['id'])
+            server.init_db()
+        self.assertEqual(provider.call_count,1);self.assertEqual(failed['state'],'llm_error')
+        self.assertEqual(failed['error_code'],'provider_outcome_unknown')
+        with server.connect() as db:
+            row=db.execute("SELECT status FROM llm_calls WHERE job_id=?",(a['id'],)).fetchone()
+            self.assertEqual(row['status'],'ambiguous')
+        self.assertEqual(server.get_attempt(a['id'])['state'],'llm_error')
+
+    def test_crash_after_send_becomes_ambiguous_instead_of_requeued(self):
+        with patch.object(server,'run_judge',self.fake_judge):
+            a=self.wait_judge(self.submit())
+        a['mode']='gemini';a['state']='generating';a['tries']=1;server.save_attempt(a)
+        with patch.dict(os.environ,{'LLM_QUOTA_BUCKET':'restart-sent','LLM_RPM':'1000'}):
+            decision=server.reserve_budget(100,a['id'],'generate',1,f"{a['id']}:generate:1",1000000)
+            self.assertTrue(decision.granted)
+            server.mark_call_sent(a,decision.call_id)
+            server.init_db()
+        restored=server.get_attempt(a['id'])
+        self.assertEqual((restored['state'],restored['error_code']),('llm_error','provider_outcome_unknown'))
+
+    def test_crash_before_send_requeues_reserved_call_without_reusing_it(self):
+        with patch.object(server,'run_judge',self.fake_judge):
+            a=self.wait_judge(self.submit())
+        a['mode']='gemini';a['state']='generating';server.save_attempt(a)
+        with patch.dict(os.environ,{'LLM_QUOTA_BUCKET':'restart-reserved','LLM_RPM':'1000'}):
+            call_id=f"{a['id']}:generate:1"
+            self.assertTrue(server.reserve_budget(100,a['id'],'generate',1,call_id,1100000).granted)
+            server.init_db()
+        restored=server.get_attempt(a['id'])
+        self.assertEqual(restored['state'],'generate_pending');self.assertEqual(restored['tries'],1)
+        with server.connect() as db:
+            self.assertEqual(db.execute("SELECT status FROM llm_calls WHERE call_id=?",(call_id,)).fetchone()['status'],'abandoned')
+
+    def test_provider_minute_429_retries_once_through_same_limiter(self):
+        with patch.object(server,'run_judge',self.fake_judge):
+            a=self.wait_judge(self.submit())
+        a['mode']='gemini';server.save_attempt(a)
+        generated=llm.demo_result(a)
+        rate=llm.ProviderError('minute quota',True,20,code='provider_minute_quota',request_sent=True)
+        with patch.dict(os.environ,{'GEMINI_API_KEY':'test-not-real','LLM_QUOTA_BUCKET':'provider-429',
+             'LLM_RPM':'5'}),patch.object(server,'call_gemini',side_effect=[rate,llm.ProviderResponse(generated,100,50,150)]) as provider, \
+             patch.object(server.random,'uniform',return_value=0):
+            server.process_llm(a,1200000)
+            pending=server.get_attempt(a['id'])
+            self.assertEqual(pending['state'],'generate_pending');self.assertEqual(pending['next_run'],1200020)
+            self.assertIsNone(server.claim_llm_job(1200019))
+            claimed=server.claim_llm_job(1200020.1);self.assertIsNotNone(claimed)
+            server.process_llm(claimed,1200020.1)
+        self.assertEqual(provider.call_count,2)
+        self.assertEqual(server.get_attempt(a['id'])['state'],'mcq_ready')
+        with server.connect() as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM llm_calls WHERE job_id=?",(a['id'],)).fetchone()[0],2)
+
+    def test_provider_429_classification_is_not_blind(self):
+        daily_body=json.dumps({'error':{'details':[{'quotaId':'GenerateRequestsPerDay'}]}}).encode()
+        daily=urllib.error.HTTPError('https://example',429,'quota',{},io.BytesIO(daily_body))
+        classified=llm._http_error(daily)
+        daily.close()
+        self.assertEqual(classified.code,'provider_daily_quota');self.assertFalse(classified.retryable)
+        unknown=urllib.error.HTTPError('https://example',429,'quota',{},io.BytesIO(b'{}'))
+        classified=llm._http_error(unknown)
+        unknown.close()
+        self.assertEqual(classified.code,'provider_rate_limit_unknown');self.assertFalse(classified.retryable)
+        minute=urllib.error.HTTPError('https://example',429,'quota',{'Retry-After':'20'},io.BytesIO(b'{}'))
+        classified=llm._http_error(minute)
+        minute.close()
+        self.assertEqual(classified.code,'provider_minute_quota');self.assertTrue(classified.retryable)
+        self.assertEqual(classified.retry_after,20)
 
     def test_llm_retry_bounded_and_bad_schema_rejected(self):
         with patch.object(server,'run_judge',self.fake_judge):a=self.wait_judge(self.submit())
         a['mode']='gemini'
-        with patch.dict(os.environ,{'LLM_MODE':'gemini','GEMINI_API_KEY':'test-not-real'}),patch.object(server,'reserve_budget',return_value=0),patch.object(server,'call_gemini',side_effect=llm.ProviderError('429',True,20)) as provider:
+        failure=llm.ProviderError('provider unavailable',True,0,code='provider_unavailable',request_sent=True)
+        with patch.dict(os.environ,{'LLM_MODE':'gemini','GEMINI_API_KEY':'test-not-real','LLM_RPM':'1000',
+             'LLM_QUOTA_BUCKET':'retry-test'}),patch.object(server,'call_gemini',side_effect=failure) as provider, \
+             patch.object(server.random,'uniform',return_value=0):
             for index in range(3):
-                server.process_llm(a);a=server.get_attempt(a['id'])
+                server.process_llm(a,400000+index);a=server.get_attempt(a['id'])
             self.assertEqual(provider.call_count,3);self.assertEqual(a['state'],'llm_error')
+            self.assertEqual(a['tries'],3);self.assertEqual(a['error_code'],'provider_unavailable')
         q=llm.demo_result(a);q['questions'][0]['skill']='S9'
         with self.assertRaises(ValueError):llm.validate_result(q,a)
 
@@ -249,7 +458,8 @@ class MVPTests(unittest.TestCase):
         self.request(self.client,f"/api/attempts/{a['id']}/answers",{'answers':[0,1,2]})
         a=server.get_attempt(a['id']);a['state']='feedback_running';server.save_attempt(a)
         server.init_db();restored=server.get_attempt(a['id'])
-        self.assertEqual(restored['state'],'feedback_pending');self.assertEqual(restored['answers'],[0,1,2])
+        self.assertEqual(restored['state'],'llm_error');self.assertEqual(restored['error_code'],'provider_outcome_unknown')
+        self.assertEqual(restored['answers'],[0,1,2])
 
     def test_csrf_and_invalid_answer_types(self):
         a=self.ready()

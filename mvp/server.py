@@ -1,22 +1,27 @@
 """CodeLit Sprint 2. Railway API with remote GCP Docker judging."""
 import concurrent.futures
 from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, time as datetime_time, timedelta
 import hashlib
 import hmac
 import json
 import os
 from pathlib import Path
 import random
+import re
 import sqlite3
 import threading
 import time
+import uuid
+from zoneinfo import ZoneInfo
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 from bank import parse_xml, problem_xml, moodle_xml, validate_problem
 from judge_client import JudgeClient
-from llm import ProviderError, build_request, call_gemini, demo_result, validate_result
+from llm import ProviderError, ProviderResponse, build_request, call_gemini, demo_result, encode_payload, validate_result
 import google_login
 
 ROOT = Path(__file__).resolve().parent
@@ -24,6 +29,16 @@ LOCK = threading.RLock()
 STOP = threading.Event()
 POOL = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 ACTIVE = {"judging", "generate_pending", "generating", "feedback_pending", "feedback_running"}
+PACIFIC = ZoneInfo("America/Los_Angeles")
+
+
+@dataclass(frozen=True)
+class QuotaDecision:
+    granted: bool
+    call_id: str
+    wait_until: float = 0
+    reason: str = ""
+    reset_at: float = 0
 
 
 def load_env():
@@ -46,6 +61,63 @@ def connect():
         db.close()
 
 
+def env_int(name, default, minimum=1, maximum=1_000_000):
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer.") from exc
+    if not minimum <= value <= maximum:
+        raise RuntimeError(f"{name} must be between {minimum} and {maximum}.")
+    return value
+
+
+def quota_bucket():
+    bucket = os.getenv("LLM_QUOTA_BUCKET", "codelit-google-project").strip()
+    if not re.fullmatch(r"[a-zA-Z0-9._:/-]{1,128}", bucket):
+        raise RuntimeError("LLM_QUOTA_BUCKET is invalid.")
+    return bucket
+
+
+def quota_limits():
+    return {
+        "rpm": env_int("LLM_RPM", 5, maximum=1000),
+        "rpd": env_int("LLM_RPD", 20, maximum=1_000_000),
+        "tpm": env_int("LLM_INPUT_TPM", 250000, maximum=100_000_000),
+        "queue_timeout": env_int("LLM_QUEUE_TIMEOUT_SECONDS", 120, maximum=3600),
+        "retry_limit": env_int("LLM_RETRY_LIMIT", 3, maximum=10),
+        "queue_max": env_int("LLM_QUEUE_MAX", 20, maximum=10000),
+    }
+
+
+def quota_day_window(now):
+    local = datetime.fromtimestamp(now, PACIFIC)
+    tomorrow = local.date() + timedelta(days=1)
+    reset = datetime.combine(tomorrow, datetime_time.min, tzinfo=PACIFIC)
+    return local.date().isoformat(), reset.timestamp()
+
+
+def attempt_from_row(row):
+    return {**json.loads(row["body"]), **{k: row[k] for k in
+        ["id", "user_id", "state", "stage", "created", "next_run", "tries"]}}
+
+
+def attempt_fields(a):
+    return {k: v for k, v in a.items()
+            if k not in {"id", "user_id", "state", "stage", "created", "next_run", "tries"}}
+
+
+def save_attempt_db(db, a):
+    db.execute("UPDATE attempts SET state=?,stage=?,body=?,next_run=?,tries=? WHERE id=?",
+               (a["state"], a["stage"], json.dumps(attempt_fields(a), ensure_ascii=False),
+                a.get("next_run", 0), a.get("tries", 0), a["id"]))
+
+
+def log_llm(event, **fields):
+    safe = {"event": event, "component": "gemini", "at": round(time.time(), 3)}
+    safe.update({key: value for key, value in fields.items() if value is not None})
+    print(json.dumps(safe, ensure_ascii=False, separators=(",", ":")), flush=True)
+
+
 def init_db():
     path = Path(os.getenv("DATABASE_PATH", str(ROOT / "data" / "codelit.db")))
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -58,17 +130,75 @@ def init_db():
           stage TEXT NOT NULL, body TEXT NOT NULL, created REAL NOT NULL, next_run REAL NOT NULL DEFAULT 0, tries INTEGER NOT NULL DEFAULT 0);
         CREATE INDEX IF NOT EXISTS attempt_user ON attempts(user_id, created);
         CREATE TABLE IF NOT EXISTS mcq_bank(hash TEXT PRIMARY KEY, body TEXT NOT NULL);
+        -- Legacy table kept for one-time migration from deployments before the
+        -- shared atomic limiter.
         CREATE TABLE IF NOT EXISTS llm_usage(at REAL NOT NULL, tokens INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS llm_calls(
+          call_id TEXT PRIMARY KEY,
+          bucket TEXT NOT NULL,
+          job_id TEXT NOT NULL,
+          stage TEXT NOT NULL,
+          attempt_no INTEGER NOT NULL,
+          reserved_at REAL NOT NULL,
+          quota_day TEXT NOT NULL,
+          input_tokens_est INTEGER NOT NULL,
+          input_tokens_actual INTEGER NOT NULL DEFAULT 0,
+          output_tokens INTEGER NOT NULL DEFAULT 0,
+          total_tokens INTEGER NOT NULL DEFAULT 0,
+          status TEXT NOT NULL,
+          error_code TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS llm_calls_minute ON llm_calls(bucket,reserved_at);
+        CREATE INDEX IF NOT EXISTS llm_calls_day ON llm_calls(bucket,quota_day);
+        CREATE INDEX IF NOT EXISTS llm_calls_job ON llm_calls(job_id,stage,attempt_no);
+        CREATE TABLE IF NOT EXISTS llm_cooldowns(
+          bucket TEXT PRIMARY KEY,
+          until_at REAL NOT NULL,
+          reason TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
         """)
         google_login.initialize(db)
         for p in json.loads((ROOT / "seed.json").read_text(encoding="utf-8")):
             validate_problem(p)
             db.execute("INSERT OR IGNORE INTO problems VALUES (?,?)", (p["id"], json.dumps(p, ensure_ascii=False)))
-        # A restart cannot fabricate a pass or lose already submitted answers.
+        bucket = quota_bucket()
+        migrated = db.execute("SELECT 1 FROM settings WHERE key='llm_quota_v2_migrated'").fetchone()
+        if not migrated:
+            for row in db.execute("SELECT rowid,at,tokens FROM llm_usage ORDER BY at"):
+                day, _ = quota_day_window(row["at"])
+                db.execute("""INSERT OR IGNORE INTO llm_calls
+                    (call_id,bucket,job_id,stage,attempt_no,reserved_at,quota_day,input_tokens_est,status,error_code)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (f"legacy:{row['rowid']}:{row['at']}", bucket, "legacy", "legacy", row["rowid"],
+                     row["at"], day, row["tokens"], "legacy", "legacy_migration"))
+            old_cooldown = db.execute("SELECT value FROM settings WHERE key='cooldown'").fetchone()
+            if old_cooldown:
+                db.execute("INSERT OR REPLACE INTO llm_cooldowns VALUES (?,?,?)",
+                           (bucket, float(old_cooldown[0]), "legacy"))
+            db.execute("INSERT INTO settings VALUES ('llm_quota_v2_migrated','1')")
+        # A restart cannot fabricate a pass, lose answers, or blindly duplicate
+        # a provider request whose outcome is unknown.
         db.execute("UPDATE attempts SET state='judge_error' WHERE state='judging'")
-        db.execute("UPDATE attempts SET state='generate_pending' WHERE state='generating'")
-        db.execute("UPDATE attempts SET state='feedback_pending' WHERE state='feedback_running'")
+        for row in db.execute("SELECT * FROM attempts WHERE state IN ('generating','feedback_running')").fetchall():
+            a = attempt_from_row(row)
+            last = db.execute("""SELECT * FROM llm_calls WHERE job_id=? AND stage=?
+                ORDER BY attempt_no DESC LIMIT 1""", (a["id"], a["stage"])).fetchone()
+            if not last or last["status"] in {"sent", "ambiguous"}:
+                if last and last["status"] == "sent":
+                    db.execute("UPDATE llm_calls SET status='ambiguous',error_code='restart_after_send' WHERE call_id=?",
+                               (last["call_id"],))
+                a.update(state="llm_error", error_code="provider_outcome_unknown", retry_at=0,
+                         error="Server khởi động lại khi request Gemini đang chạy; không tự gọi lại để tránh sinh trùng.")
+            elif last["status"] == "reserved":
+                db.execute("UPDATE llm_calls SET status='abandoned',error_code='restart_before_send' WHERE call_id=?",
+                           (last["call_id"],))
+                a["tries"] = max(a["tries"], last["attempt_no"])
+                a["state"] = a["stage"] + "_pending"
+            else:
+                a.update(state="llm_error", error_code="provider_outcome_unknown", retry_at=0,
+                         error="Trạng thái Gemini không nhất quán sau restart; chưa phát hành kết quả.")
+            save_attempt_db(db, a)
         db.execute("DELETE FROM sessions WHERE expires<?", (time.time(),))
 
 
@@ -82,14 +212,12 @@ def get_attempt(aid):
         row = db.execute("SELECT * FROM attempts WHERE id=?", (aid,)).fetchone()
     if row is None:
         raise ValueError("Không tìm thấy lần nộp.")
-    return {**json.loads(row["body"]), **{k: row[k] for k in ["id", "user_id", "state", "stage", "created", "next_run", "tries"]}}
+    return attempt_from_row(row)
 
 
 def save_attempt(a):
-    fields = {k: v for k, v in a.items() if k not in {"id", "user_id", "state", "stage", "created", "next_run", "tries"}}
     with connect() as db:
-        db.execute("UPDATE attempts SET state=?,stage=?,body=?,next_run=?,tries=? WHERE id=?",
-                   (a["state"], a["stage"], json.dumps(fields, ensure_ascii=False), a.get("next_run", 0), a.get("tries", 0), a["id"]))
+        save_attempt_db(db, a)
 
 
 def public_attempt(a):
@@ -119,103 +247,267 @@ def judge_attempt(aid):
             save_attempt(a)
 
 
-def reserve_budget(tokens, now=None):
-    """One app instance; durable conservative rolling windows, including failed calls."""
-    now = time.time() if now is None else now
-    rpm, tpm, rpd = (max(1, int(os.getenv(k, default))) for k, default in [("LLM_RPM", "4"), ("LLM_INPUT_TPM", "20000"), ("LLM_RPD", "100")])
-    if tokens > tpm:
-        raise ProviderError("Nội dung vượt ngân sách input TPM cấu hình. Rút ngắn code hoặc nhờ giảng viên điều chỉnh quota.")
-    with LOCK, connect() as db:
-        usage = list(db.execute("SELECT at,tokens FROM llm_usage WHERE at>? ORDER BY at", (now - 86400,)))
-        minute = [row for row in usage if row["at"] > now - 60]
+def reserve_budget(tokens, job_id=None, stage="generate", attempt_no=1, call_id=None, now=None):
+    """Atomically reserve one real provider call in the shared SQLite bucket."""
+    now = time.time() if now is None else float(now)
+    limits = quota_limits()
+    bucket = quota_bucket()
+    day, reset_at = quota_day_window(now)
+    job_id = job_id or "test-job"
+    call_id = call_id or f"test:{uuid.uuid4().hex}"
+    if tokens > limits["tpm"]:
+        raise ProviderError("Nội dung vượt giới hạn input TPM cấu hình.", code="local_input_tpm")
+    with connect() as db:
+        # This is the cross-thread/process correctness boundary. SQLite obtains
+        # the writer lock before any counter is read.
+        db.execute("BEGIN IMMEDIATE")
+        if db.execute("SELECT 1 FROM llm_calls WHERE call_id=?", (call_id,)).fetchone():
+            raise ProviderError("Lượt gọi này đã được cấp quota; không gọi trùng.", code="duplicate_provider_call")
+        daily_count = db.execute("SELECT count(*) FROM llm_calls WHERE bucket=? AND quota_day=?",
+                                 (bucket, day)).fetchone()[0]
+        if daily_count >= limits["rpd"]:
+            raise ProviderError("Đã hết quota Gemini trong ngày theo giờ Pacific.", code="local_daily_quota",
+                                retry_at=reset_at)
+        minute = list(db.execute("""SELECT reserved_at,
+            max(input_tokens_est,input_tokens_actual) AS input_tokens
+            FROM llm_calls WHERE bucket=? AND reserved_at>? ORDER BY reserved_at""",
+            (bucket, now - 60)))
         wait_until = now
-        cooldown = db.execute("SELECT value FROM settings WHERE key='cooldown'").fetchone()
-        if cooldown:
-            wait_until = max(wait_until, float(cooldown[0]))
-        if len(usage) >= rpd:
-            wait_until = max(wait_until, usage[len(usage) - rpd]["at"] + 86401)
+        reasons = []
+        cooldown = db.execute("SELECT until_at,reason FROM llm_cooldowns WHERE bucket=?", (bucket,)).fetchone()
+        if cooldown and cooldown["until_at"] > now:
+            if cooldown["reason"] == "provider_daily_quota":
+                raise ProviderError("Google báo quota ngày chưa được reset.", code="provider_daily_quota",
+                                    retry_at=max(reset_at, cooldown["until_at"]))
+            wait_until = max(wait_until, cooldown["until_at"])
+            reasons.append(cooldown["reason"])
+        # Conservative pacing avoids a burst of five simultaneous requests.
         if minute:
-            wait_until = max(wait_until, minute[-1]["at"] + 60 / rpm)
-        if len(minute) >= rpm:
-            wait_until = max(wait_until, minute[len(minute) - rpm]["at"] + 61)
-        total = sum(row["tokens"] for row in minute)
-        for row in minute:
-            if total + tokens <= tpm:
-                break
-            wait_until = max(wait_until, row["at"] + 61)
-            total -= row["tokens"]
+            wait_until = max(wait_until, minute[-1]["reserved_at"] + 60 / limits["rpm"])
+            reasons.append("rpm_spacing")
+        if len(minute) >= limits["rpm"]:
+            wait_until = max(wait_until, minute[len(minute) - limits["rpm"]]["reserved_at"] + 60.001)
+            reasons.append("rolling_rpm")
+        used = sum(row["input_tokens"] for row in minute)
+        remaining = used
+        if used + tokens > limits["tpm"]:
+            for row in minute:
+                remaining -= row["input_tokens"]
+                if remaining + tokens <= limits["tpm"]:
+                    wait_until = max(wait_until, row["reserved_at"] + 60.001)
+                    reasons.append("input_tpm")
+                    break
         if wait_until > now:
-            return wait_until
-        db.execute("INSERT INTO llm_usage VALUES (?,?)", (now, tokens))
-        db.execute("DELETE FROM llm_usage WHERE at<?", (now - 86400,))
-    return 0
+            return QuotaDecision(False, call_id, wait_until, "+".join(dict.fromkeys(reasons)), reset_at)
+        db.execute("""INSERT INTO llm_calls
+            (call_id,bucket,job_id,stage,attempt_no,reserved_at,quota_day,input_tokens_est,status)
+            VALUES (?,?,?,?,?,?,?,?,?)""",
+            (call_id, bucket, job_id, stage, attempt_no, now, day, tokens, "reserved"))
+        # Keep enough history for debugging around a day boundary without
+        # allowing this table to grow forever.
+        db.execute("DELETE FROM llm_calls WHERE reserved_at<?", (now - 8 * 86400,))
+    return QuotaDecision(True, call_id, reset_at=reset_at)
 
 
-def process_llm(a):
-    try:
-        if a["tries"] >= 3:
-            raise ProviderError("Đã hết 3 lượt gọi tự động. Bấm Thử lại để bắt đầu một lượt mới.")
-        payload = build_request(a)
-        demo = a["mode"] == "demo"
-        if not demo:
-            if not os.getenv("GEMINI_API_KEY"):
-                raise ProviderError("Chưa cấu hình GEMINI_API_KEY trên server. Cấu hình rồi bấm Thử lại.")
-            # UTF-8 byte count is a deliberately conservative text-token estimate.
-            delayed = reserve_budget(len(json.dumps(payload, ensure_ascii=False).encode()))
-            if delayed:
-                a.update(state=a["stage"] + "_pending", next_run=delayed, error="Đang chờ ngân sách API; hệ thống sẽ tự tiếp tục.")
-                save_attempt(a)
-                return
-        a["tries"] += 1
-        save_attempt(a)
-        result = demo_result(a) if demo else call_gemini(payload)
-        result = validate_result(result, a)
-        a.update(error="", next_run=0)
+def set_cooldown(until_at, reason):
+    if until_at <= 0:
+        return
+    with connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        current = db.execute("SELECT until_at FROM llm_cooldowns WHERE bucket=?", (quota_bucket(),)).fetchone()
+        if not current or current["until_at"] < until_at:
+            db.execute("INSERT OR REPLACE INTO llm_cooldowns VALUES (?,?,?)",
+                       (quota_bucket(), until_at, reason))
+
+
+def gemini_calls_for_job(job_id):
+    with connect() as db:
+        return db.execute("SELECT count(*) FROM llm_calls WHERE job_id=? AND status!='legacy'", (job_id,)).fetchone()[0]
+
+
+def save_attempt_and_call(a, call_id, status, error_code="", usage=None):
+    usage = usage or {}
+    with connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        changed = db.execute("""UPDATE llm_calls SET status=?,error_code=?,input_tokens_actual=?,output_tokens=?,total_tokens=?
+            WHERE call_id=?""", (status, error_code, usage.get("prompt_tokens", 0),
+            usage.get("output_tokens", 0), usage.get("total_tokens", 0), call_id)).rowcount
+        if changed != 1:
+            raise RuntimeError("Reserved Gemini quota row is missing.")
+        save_attempt_db(db, a)
+
+
+def mark_call_sent(a, call_id):
+    with connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        changed = db.execute("UPDATE llm_calls SET status='sent' WHERE call_id=? AND status='reserved'",
+                             (call_id,)).rowcount
+        if changed != 1:
+            raise ProviderError("Không thể đánh dấu lượt gọi duy nhất; đã chặn request trùng.",
+                                code="duplicate_provider_call")
+        save_attempt_db(db, a)
+
+
+def apply_llm_result(a, result, call_id=None, usage=None):
+    a.update(error="", error_code="", retry_at=0, quota_reset_at=0, next_run=0)
+    if a["stage"] == "generate":
+        a.update(questions=result, state="mcq_ready")
+    else:
+        a.update(feedback=result, state="completed")
+    with connect() as db:
+        db.execute("BEGIN IMMEDIATE")
         if a["stage"] == "generate":
-            a.update(questions=result, state="mcq_ready")
-            with connect() as db:
-                for q in result:
-                    encoded = json.dumps({**q, "problem_id": a["problem"]["id"]}, ensure_ascii=False, sort_keys=True)
-                    db.execute("INSERT OR IGNORE INTO mcq_bank VALUES (?,?)", (hashlib.sha256(encoded.encode()).hexdigest(), encoded))
-        else:
-            a.update(feedback=result, state="completed")
-        with LOCK:
+            for q in result:
+                encoded = json.dumps({**q, "problem_id": a["problem"]["id"]}, ensure_ascii=False, sort_keys=True)
+                db.execute("INSERT OR IGNORE INTO mcq_bank VALUES (?,?)",
+                           (hashlib.sha256(encoded.encode()).hexdigest(), encoded))
+        if call_id:
+            usage = usage or {}
+            changed = db.execute("""UPDATE llm_calls SET status='success',error_code='',input_tokens_actual=?,
+                output_tokens=?,total_tokens=? WHERE call_id=?""", (usage.get("prompt_tokens", 0),
+                usage.get("output_tokens", 0), usage.get("total_tokens", 0), call_id)).rowcount
+            if changed != 1:
+                raise RuntimeError("Reserved Gemini quota row is missing.")
+        save_attempt_db(db, a)
+
+
+def process_llm(a, now=None):
+    now = time.time() if now is None else float(now)
+    call_id = None
+    call_reserved = False
+    try:
+        payload = build_request(a)
+        if a["mode"] == "demo":
+            result = validate_result(demo_result(a), a)
+            apply_llm_result(a, result)
+            return
+        if not os.getenv("GEMINI_API_KEY"):
+            raise ProviderError("Chưa cấu hình GEMINI_API_KEY trên server. Cấu hình rồi bấm Thử lại.",
+                                code="provider_not_configured")
+        limits = quota_limits()
+        if a["tries"] >= limits["retry_limit"]:
+            raise ProviderError(f"Đã hết {limits['retry_limit']} lượt gọi Gemini cho giai đoạn này.",
+                                code="retry_exhausted")
+        call_no = a["tries"] + 1
+        call_id = f"{a['id']}:{a['stage']}:{call_no}"
+        # UTF-8 JSON bytes are a deliberately conservative local estimate and
+        # avoid spending another API call merely to count tokens.
+        estimated_tokens = len(encode_payload(payload))
+        decision = reserve_budget(estimated_tokens, a["id"], a["stage"], call_no, call_id, now)
+        if not decision.granted:
+            wait = decision.wait_until - now
+            queue_started_at = a.get("queue_started_at") or now
+            queue_deadline = queue_started_at + limits["queue_timeout"]
+            a["queue_started_at"] = queue_started_at
+            if decision.wait_until > queue_deadline:
+                a.update(state="llm_error", error_code="quota_wait_too_long", retry_at=decision.wait_until,
+                         quota_reset_at=decision.reset_at,
+                         error="Hàng đợi quota vượt thời gian chờ cho phép; hãy thử lại sau.")
+                log_llm("rejected", job_id=a["id"], stage=a["stage"], reason=decision.reason,
+                        wait_seconds=round(now - queue_started_at, 3),
+                        retry_at=round(decision.wait_until, 3), input_tokens_est=estimated_tokens)
+            else:
+                a.update(state=a["stage"] + "_pending", next_run=decision.wait_until,
+                         error_code="quota_wait", retry_at=decision.wait_until,
+                         quota_reset_at=decision.reset_at,
+                         error="Đang chờ lượt gọi Gemini trong hàng đợi quota.")
+                log_llm("queued", job_id=a["id"], stage=a["stage"], reason=decision.reason,
+                        wait_seconds=round(wait, 3), input_tokens_est=estimated_tokens)
             save_attempt(a)
+            return
+        call_reserved = True
+        a.pop("queue_started_at", None)
+        a["tries"] = call_no
+        a.update(error="", error_code="", retry_at=0, quota_reset_at=decision.reset_at)
+        mark_call_sent(a, call_id)
+        log_llm("call_started", job_id=a["id"], stage=a["stage"], call_no=call_no,
+                calls_for_job=gemini_calls_for_job(a["id"]), input_tokens_est=estimated_tokens)
+        response = call_gemini(payload)
+        if isinstance(response, ProviderResponse):
+            result = response.result
+            usage = {"prompt_tokens": response.prompt_tokens, "output_tokens": response.output_tokens,
+                     "total_tokens": response.total_tokens}
+        else:  # Test doubles may return the validated provider JSON directly.
+            result, usage = response, {}
+        result = validate_result(result, a)
+        apply_llm_result(a, result, call_id, usage)
+        log_llm("call_succeeded", job_id=a["id"], stage=a["stage"], call_no=call_no,
+                calls_for_job=gemini_calls_for_job(a["id"]), **usage)
     except ProviderError as exc:
-        a["error"] = str(exc)
-        if exc.retryable and a["tries"] < 3:
+        retry_limit = quota_limits()["retry_limit"]
+        a.update(error=str(exc), error_code=exc.code, retry_at=exc.retry_at or 0)
+        if exc.code in {"local_daily_quota", "provider_daily_quota"}:
+            _, reset_at = quota_day_window(now)
+            a["quota_reset_at"] = max(exc.retry_at, reset_at)
+            a["retry_at"] = a["quota_reset_at"]
+            a["state"] = "llm_error"
+            if exc.code == "provider_daily_quota":
+                set_cooldown(a["quota_reset_at"], "provider_daily_quota")
+        elif exc.retryable and a["tries"] < retry_limit:
             delay = max(exc.retry_after, 15 * (2 ** max(0, a["tries"] - 1))) + random.uniform(0, 3)
-            a.update(state=a["stage"] + "_pending", next_run=time.time() + delay)
-            with connect() as db:
-                db.execute("INSERT OR REPLACE INTO settings VALUES ('cooldown',?)", (str(a["next_run"]),))
+            retry_at = now + delay
+            a["retry_at"] = retry_at
+            if delay <= quota_limits()["queue_timeout"]:
+                a.update(state=a["stage"] + "_pending", next_run=retry_at)
+                if exc.code in {"provider_minute_quota", "provider_rate_limit_unknown"}:
+                    set_cooldown(retry_at, exc.code)
+            else:
+                a["state"] = "llm_error"
         else:
             a["state"] = "llm_error"
-        save_attempt(a)
+        if call_reserved and exc.code != "duplicate_provider_call":
+            status = "ambiguous" if exc.code == "provider_outcome_unknown" else "failed"
+            save_attempt_and_call(a, call_id, status, exc.code)
+        else:
+            save_attempt(a)
+        log_llm("call_failed", job_id=a["id"], stage=a["stage"], call_no=a.get("tries", 0),
+                calls_for_job=gemini_calls_for_job(a["id"]), reason=exc.code,
+                retry_at=round(a.get("retry_at", 0), 3) or None)
     except Exception:
-        a.update(state="llm_error", error="LLM trả cấu trúc không hợp lệ hoặc xử lý gặp lỗi. Chưa phát hành kết quả; có thể thử lại.")
-        save_attempt(a)
+        a.update(state="llm_error", error_code="invalid_result", retry_at=0,
+                 error="LLM trả cấu trúc không hợp lệ. Kết quả chưa hoàn chỉnh không được phát hành.")
+        if call_reserved:
+            save_attempt_and_call(a, call_id, "failed", "invalid_result")
+        else:
+            save_attempt(a)
+        log_llm("call_failed", job_id=a["id"], stage=a["stage"], call_no=a.get("tries", 0),
+                calls_for_job=gemini_calls_for_job(a["id"]), reason="invalid_result")
+
+
+def claim_llm_job(now=None):
+    now = time.time() if now is None else now
+    with connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute("""SELECT * FROM attempts
+            WHERE state IN ('generate_pending','feedback_pending') AND next_run<=?
+            ORDER BY created LIMIT 1""", (now,)).fetchone()
+        if not row:
+            return None
+        pending = row["state"]
+        running = "generating" if row["stage"] == "generate" else "feedback_running"
+        if db.execute("UPDATE attempts SET state=? WHERE id=? AND state=?", (running, row["id"], pending)).rowcount != 1:
+            return None
+        updated = db.execute("SELECT * FROM attempts WHERE id=?", (row["id"],)).fetchone()
+        return attempt_from_row(updated)
 
 
 def llm_worker():
     while not STOP.wait(0.5):
         try:
-            with LOCK:
-                with connect() as db:
-                    row = db.execute("SELECT id FROM attempts WHERE state IN ('generate_pending','feedback_pending') AND next_run<=? ORDER BY created LIMIT 1", (time.time(),)).fetchone()
-                if not row:
-                    continue
-                a = get_attempt(row["id"])
-                a["state"] = "generating" if a["stage"] == "generate" else "feedback_running"
-                save_attempt(a)
-            process_llm(a)
+            a = claim_llm_job()
+            if a:
+                process_llm(a)
         except Exception:
             # Keep worker alive. No source, prompts, credentials, or student data in logs.
-            print("LLM worker: transient internal error", flush=True)
+            log_llm("worker_error", reason="transient_internal_error")
 
 
 class APIError(Exception):
-    def __init__(self, status, message):
-        self.status, self.message = status, message
+    def __init__(self, status, message, code="request_error", **details):
+        self.status, self.message, self.code, self.details = status, message, code, details
+
+    def payload(self):
+        return {"error": self.message, "code": self.code, **self.details}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -270,7 +562,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.get()
         except APIError as exc:
-            self.reply({"error": exc.message}, exc.status)
+            self.reply(exc.payload(), exc.status)
         except ValueError as exc:
             self.reply({"error": str(exc)}, 400)
         except Exception:
@@ -308,7 +600,7 @@ class Handler(BaseHTTPRequestHandler):
             mime = {"index.html": "text/html; charset=utf-8", "app.js": "text/javascript; charset=utf-8", "style.css": "text/css; charset=utf-8", "favicon.svg": "image/svg+xml"}[name]
             return self.reply((ROOT / "static" / name).read_bytes(), content_type=mime)
         if path == "/api/config":
-            return self.reply({"mode": os.getenv("LLM_MODE", "gemini"), "model": os.getenv("GEMINI_MODEL", "gemini-3.6-flash"), "llm_configured": bool(os.getenv("GEMINI_API_KEY")), "language": "C++17", "google_configured": google_login.configured()})
+            return self.reply({"mode": os.getenv("LLM_MODE", "gemini"), "model": os.getenv("GEMINI_MODEL", "gemini-3.8-flash"), "llm_configured": bool(os.getenv("GEMINI_API_KEY")), "language": "C++17", "google_configured": google_login.configured()})
         if path == "/api/me":
             return self.reply(self.identity())
         if path == "/api/problems":
@@ -357,7 +649,7 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 self.post(urlparse(self.path).path, data)
         except APIError as exc:
-            self.reply({"error": exc.message}, exc.status)
+            self.reply(exc.payload(), exc.status)
         except (ValueError, TypeError, KeyError) as exc:
             self.reply({"error": str(exc) if isinstance(exc, ValueError) else "Dữ liệu yêu cầu không hợp lệ."}, 400)
         except Exception:
@@ -391,23 +683,34 @@ class Handler(BaseHTTPRequestHandler):
             code, pid, key = data.get("code"), data.get("problem_id"), data.get("request_id")
             if not isinstance(code, str) or not code.strip() or len(code.encode()) > 12000:
                 raise ValueError("Code cần 1–12000 byte.")
-            if not isinstance(pid, str) or pid not in all_problems():
+            problems = all_problems()
+            if not isinstance(pid, str) or pid not in problems:
                 raise ValueError("Bài toán không tồn tại.")
-            if not isinstance(key, str) or not __import__('re').fullmatch(r"[a-zA-Z0-9-]{8,80}", key):
+            if not isinstance(key, str) or not re.fullmatch(r"[a-zA-Z0-9-]{8,80}", key):
                 raise ValueError("Request ID không hợp lệ.")
             aid = hashlib.sha256((uid + key).encode()).hexdigest()[:32]
             with connect() as db:
-                if db.execute("SELECT 1 FROM attempts WHERE id=?", (aid,)).fetchone():
-                    old = get_attempt(aid)
+                db.execute("BEGIN IMMEDIATE")
+                existing = db.execute("SELECT * FROM attempts WHERE id=?", (aid,)).fetchone()
+                if existing:
+                    old = attempt_from_row(existing)
                     if old["code"] != code or old["problem"]["id"] != pid:
-                        raise APIError(409, "Request ID đã được dùng cho nội dung khác.")
+                        raise APIError(409, "Request ID đã được dùng cho nội dung khác.", "idempotency_conflict")
                     return self.reply(public_attempt(old))
                 rows = list(db.execute("SELECT state,created FROM attempts WHERE user_id=?", (uid,)))
                 if any(row["state"] in ACTIVE for row in rows):
-                    raise APIError(409, "Bạn đang có một bài đang xử lý. Chờ hoàn tất trước khi nộp tiếp.")
+                    raise APIError(409, "Bạn đang có một bài đang xử lý. Chờ hoàn tất trước khi nộp tiếp.",
+                                   "user_job_active")
                 if sum(row["created"] > time.time() - 60 for row in rows) >= 5:
-                    raise APIError(429, "Tối đa 5 lần nộp/phút. Vui lòng đợi một chút.")
-                body = {"problem": all_problems()[pid], "code": code, "mode": os.getenv("LLM_MODE", "gemini"), "error": ""}
+                    raise APIError(429, "Tối đa 5 lần nộp/phút. Vui lòng đợi một chút.",
+                                   "submission_rate_limit", retry_at=time.time() + 60)
+                queued = db.execute("SELECT count(*) FROM attempts WHERE state IN (?,?,?,?,?)",
+                    tuple(ACTIVE)).fetchone()[0]
+                if queued >= quota_limits()["queue_max"]:
+                    raise APIError(429, "Hàng đợi xử lý đang đầy; chưa tạo thêm job Gemini.", "llm_queue_full",
+                                   retry_at=time.time() + 15)
+                body = {"problem": problems[pid], "code": code, "mode": os.getenv("LLM_MODE", "gemini"),
+                        "error": "", "error_code": "", "retry_at": 0, "quota_reset_at": 0}
                 db.execute("INSERT INTO attempts(id,user_id,state,stage,body,created) VALUES (?,?,'judging','generate',?,?)", (aid, uid, json.dumps(body, ensure_ascii=False), time.time()))
             POOL.submit(judge_attempt, aid)
             return self.reply(public_attempt(get_attempt(aid)), 202)
@@ -438,7 +741,11 @@ class Handler(BaseHTTPRequestHandler):
                 if any(row["id"] != a["id"] and row["state"] in ACTIVE for row in rows):
                     raise APIError(409, "Bạn đang có một lần nộp khác đang xử lý.")
                 judge = a["state"] == "judge_error"
-                a.update(state="judging" if judge else a["stage"] + "_pending", tries=0, next_run=0, error="")
+                if not judge and a["tries"] >= quota_limits()["retry_limit"]:
+                    raise APIError(409, "Đã hết giới hạn gọi Gemini cho giai đoạn này.", "retry_exhausted")
+                a.update(state="judging" if judge else a["stage"] + "_pending",
+                         tries=0 if judge else a["tries"], next_run=0, error="", error_code="", retry_at=0)
+                a.pop("queue_started_at", None)
                 save_attempt(a)
                 if judge:
                     POOL.submit(judge_attempt, a["id"])
@@ -446,10 +753,29 @@ class Handler(BaseHTTPRequestHandler):
         raise APIError(404, "Không tìm thấy thao tác.")
 
 
+def validate_runtime_config():
+    if os.getenv("LLM_MODE", "gemini") not in {"gemini", "demo"}:
+        raise RuntimeError("LLM_MODE must be gemini or demo.")
+    quota_limits()
+    quota_bucket()
+    model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+    if not re.fullmatch(r"[a-zA-Z0-9.-]+", model):
+        raise RuntimeError("GEMINI_MODEL is invalid.")
+    try:
+        timeout = float(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
+    except ValueError as exc:
+        raise RuntimeError("LLM_TIMEOUT_SECONDS must be numeric.") from exc
+    if not 1 <= timeout <= 300:
+        raise RuntimeError("LLM_TIMEOUT_SECONDS must be between 1 and 300.")
+    env_int("LLM_MAX_OUTPUT_TOKENS", 4096, minimum=1, maximum=65536)
+
+
 def main():
     load_env()
-    if os.getenv("LLM_MODE", "gemini") not in {"gemini", "demo"}:
-        raise SystemExit("LLM_MODE must be gemini or demo")
+    try:
+        validate_runtime_config()
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
     init_db()
     threading.Thread(target=llm_worker, daemon=True).start()
     server = ThreadingHTTPServer((os.getenv("HOST", "127.0.0.1"), int(os.getenv("PORT", "8000"))), Handler)
